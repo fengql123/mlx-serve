@@ -309,6 +309,12 @@ fn writeCommonFields(w: *std.Io.Writer, root: std.json.ObjectMap) !void {
             try passNumberOpt(w, opts, "presence_penalty", "presence_penalty");
             try passNumberOpt(w, opts, "frequency_penalty", "frequency_penalty");
             try passNumberOpt(w, opts, "seed", "seed");
+            // llama.cpp/vLLM's `ignore_eos`, spelled as an option here: only
+            // num_predict ends the turn. The /v1 handler owns the semantics
+            // (and 400s it without a num_predict).
+            if (opts.get("ignore_eos")) |v| {
+                if (v == .bool) try w.print(",\"ignore_eos\":{}", .{v.bool});
+            }
             if (opts.get("stop")) |sv| {
                 switch (sv) {
                     .string, .array => {
@@ -344,6 +350,13 @@ fn writeCommonFields(w: *std.Io.Writer, root: std.json.ObjectMap) !void {
             else => false,
         };
         if (on) try w.writeAll(",\"enable_thinking\":true");
+    }
+    // vLLM's extra Jinja variables, passed through for the /v1 handler.
+    if (root.get("chat_template_kwargs")) |kv| {
+        if (kv == .object) {
+            try w.writeAll(",\"chat_template_kwargs\":");
+            try writeJsonValue(w, kv);
+        }
     }
 }
 
@@ -1118,6 +1131,40 @@ test "ollama: chat request honors stream:false and maps options" {
     try testing.expectEqualStrings("END", root.get("stop").?.array.items[0].string);
     // num_ctx is deliberately dropped.
     try testing.expect(root.get("num_ctx") == null);
+}
+
+test "ollama: options.ignore_eos and chat_template_kwargs reach the /v1 body (chat and generate)" {
+    const allocator = testing.allocator;
+    var tr = try translateChatRequest(allocator,
+        \\{"model":"m","think":true,"messages":[{"role":"user","content":"hi"}],
+        \\ "chat_template_kwargs":{"enable_thinking":true,"preserve_thinking":true},
+        \\ "options":{"num_predict":300,"ignore_eos":true,"repeat_penalty":1}}
+    );
+    defer tr.deinit(allocator);
+    var parsed = try parseTestJson(allocator, tr.body);
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try testing.expect(root.get("ignore_eos").?.bool);
+    try testing.expectEqual(@as(i64, 300), root.get("max_tokens").?.integer);
+    try testing.expect(root.get("chat_template_kwargs").?.object.get("preserve_thinking").?.bool);
+
+    var gen = try translateGenerateRequest(allocator,
+        \\{"model":"m","prompt":"hi","options":{"num_predict":8,"ignore_eos":false}}
+    );
+    defer gen.deinit(allocator);
+    var gparsed = try parseTestJson(allocator, gen.body);
+    defer gparsed.deinit();
+    try testing.expect(!gparsed.value.object.get("ignore_eos").?.bool);
+    try testing.expect(gparsed.value.object.get("chat_template_kwargs") == null);
+
+    // A non-bool option is not a signal.
+    var odd = try translateChatRequest(allocator,
+        \\{"model":"m","messages":[{"role":"user","content":"hi"}],"options":{"ignore_eos":"yes"}}
+    );
+    defer odd.deinit(allocator);
+    var oparsed = try parseTestJson(allocator, odd.body);
+    defer oparsed.deinit();
+    try testing.expect(oparsed.value.object.get("ignore_eos") == null);
 }
 
 test "ollama: chat think, format and tools translate" {
