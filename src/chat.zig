@@ -691,7 +691,14 @@ fn renderChatTemplateWith(
     var extra_json = try serializeExtraContext(allocator, chat_config, enable_thinking, effort);
     defer allocator.free(extra_json);
     if (template_kwargs) |kwargs| {
-        const merged = try overlayTemplateKwargs(allocator, extra_json, kwargs);
+        // With kwargs, a variable the client left out is undefined, as on
+        // vLLM: Qwen3.8's thinking arm then takes the template's own default
+        // (xhigh) rather than our "low" for silence (`qwen38EffortFor`).
+        const undefine: []const []const u8 = if (effort == null and enable_thinking and isQwen38EffortTemplate(chat_config.chat_template))
+            &.{"reasoning_effort"}
+        else
+            &.{};
+        const merged = try overlayTemplateKwargs(allocator, extra_json, kwargs, undefine);
         allocator.free(extra_json);
         extra_json = merged;
     }
@@ -1120,6 +1127,25 @@ pub fn isQwen38EffortTemplate(tpl: []const u8) bool {
     return std.mem.indexOf(u8, tpl, "'xhigh'") != null;
 }
 
+/// What the template does with an UNDEFINED `enable_thinking` (vLLM leaves it
+/// so when `chat_template_kwargs` omits it): true when it reads undefined as
+/// thinking on (every Qwen3.x template), false for an explicit off default,
+/// null when the template's own default cannot be read off its source.
+pub fn templateThinkingWhenUndefined(tpl: []const u8) ?bool {
+    for ([_][]const u8{ "enable_thinking|default(false)", "enable_thinking | default(false)" }) |p| {
+        if (std.mem.indexOf(u8, tpl, p) != null) return false;
+    }
+    for ([_][]const u8{
+        "enable_thinking|default(true)",
+        "enable_thinking | default(true)",
+        "enable_thinking is defined and enable_thinking is false",
+        "enable_thinking is undefined or enable_thinking is true",
+    }) |p| {
+        if (std.mem.indexOf(u8, tpl, p) != null) return true;
+    }
+    return null;
+}
+
 pub fn templateConsumesEffort(tpl: []const u8) bool {
     return std.mem.indexOf(u8, tpl, "reasoning_effort") != null;
 }
@@ -1172,14 +1198,17 @@ fn k2EffortFor(effort: ?[]const u8) []const u8 {
 }
 
 /// Overlay `kwargs` (a JSON object) on the extra-context object `base`; a key
-/// in both takes the kwargs value. Caller frees the result.
-pub fn overlayTemplateKwargs(allocator: std.mem.Allocator, base: []const u8, kwargs: []const u8) ![]const u8 {
+/// in both takes the kwargs value. The `undefine` keys are removed from `base`
+/// first, so the template sees them undefined unless `kwargs` sets them.
+/// Caller frees the result.
+pub fn overlayTemplateKwargs(allocator: std.mem.Allocator, base: []const u8, kwargs: []const u8, undefine: []const []const u8) ![]const u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var merged = try std.json.parseFromSliceLeaky(std.json.Value, a, base, .{});
     const extra = try std.json.parseFromSliceLeaky(std.json.Value, a, kwargs, .{});
     if (merged != .object or extra != .object) return error.InvalidTemplateKwargs;
+    for (undefine) |key| _ = merged.object.orderedRemove(key);
     var it = extra.object.iterator();
     while (it.next()) |e| try merged.object.put(a, e.key_ptr.*, e.value_ptr.*);
     return std.json.Stringify.valueAlloc(allocator, merged, .{});
@@ -9597,10 +9626,14 @@ test "renderChatTemplate: |min picks the smaller element, |max the larger" {
 
 test "overlayTemplateKwargs: a client key wins over the server's, others pass through" {
     const allocator = testing.allocator;
-    const merged = try overlayTemplateKwargs(allocator, "{\"eos_token\":\"</s>\",\"reasoning_effort\":\"no_think\"}", "{\"reasoning_effort\":\"low\",\"custom\":[1,true]}");
+    const merged = try overlayTemplateKwargs(allocator, "{\"eos_token\":\"</s>\",\"reasoning_effort\":\"no_think\"}", "{\"reasoning_effort\":\"low\",\"custom\":[1,true]}", &.{});
     defer allocator.free(merged);
     try testing.expectEqualStrings("{\"eos_token\":\"</s>\",\"reasoning_effort\":\"low\",\"custom\":[1,true]}", merged);
-    try testing.expectError(error.InvalidTemplateKwargs, overlayTemplateKwargs(allocator, "{}", "[1]"));
+    try testing.expectError(error.InvalidTemplateKwargs, overlayTemplateKwargs(allocator, "{}", "[1]", &.{}));
+    // An undefined key leaves the context unless the kwargs set it again.
+    const dropped = try overlayTemplateKwargs(allocator, "{\"enable_thinking\":true,\"reasoning_effort\":\"low\"}", "{}", &.{"reasoning_effort"});
+    defer allocator.free(dropped);
+    try testing.expectEqualStrings("{\"enable_thinking\":true}", dropped);
 }
 
 test "renderChatTemplate: chat_template_kwargs reach the Jinja context and override derived keys" {
@@ -9619,6 +9652,53 @@ test "renderChatTemplate: chat_template_kwargs reach the Jinja context and overr
     const with = try renderChatTemplateWith(allocator, &messages, &config, null, null, false, null, false, "{\"reasoning_effort\":\"low\",\"custom_flag\":\"on\"}");
     defer allocator.free(with);
     try testing.expectEqualStrings("low|on|False", with);
+}
+
+test "templateThinkingWhenUndefined: Qwen templates read undefined as on, explicit defaults win, others unknown" {
+    try testing.expectEqual(@as(?bool, true), templateThinkingWhenUndefined("{%- if enable_thinking is defined and enable_thinking is false %}"));
+    try testing.expectEqual(@as(?bool, true), templateThinkingWhenUndefined("{%- if enable_thinking is undefined or enable_thinking is true %}"));
+    try testing.expectEqual(@as(?bool, false), templateThinkingWhenUndefined("{%- set t = enable_thinking | default(false) %}{%- if enable_thinking is defined and enable_thinking is false %}"));
+    try testing.expectEqual(@as(?bool, null), templateThinkingWhenUndefined("{%- if enable_thinking %}<think>{% endif %}"));
+}
+
+test "renderChatTemplate: Qwen3.8 kwargs that omit reasoning_effort render the template's own default" {
+    const allocator = testing.allocator;
+    // The Qwen3.8 effort head, reduced: `reasoning_effort|default('xhigh')`.
+    var config = ChatConfig{
+        .chat_template = "{%- if enable_thinking is undefined or enable_thinking is true %}{{ reasoning_effort|default('xhigh') }}{%- else %}off{%- endif %}|{{ preserve_thinking }}",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+    // vLLM: the variable is undefined, so the template picks xhigh.
+    const kw = try renderChatTemplateWith(allocator, &messages, &config, null, null, true, null, false, "{\"preserve_thinking\":true}");
+    defer allocator.free(kw);
+    try testing.expectEqualStrings("xhigh|True", kw);
+    // An empty object (every key consumed) is still "kwargs sent".
+    const empty = try renderChatTemplateWith(allocator, &messages, &config, null, null, true, null, false, "{}");
+    defer allocator.free(empty);
+    try testing.expectEqualStrings("xhigh|", empty);
+    // A named effort still maps per family.
+    const named = try renderChatTemplateWith(allocator, &messages, &config, null, null, true, "medium", false, "{\"preserve_thinking\":true}");
+    defer allocator.free(named);
+    try testing.expectEqualStrings("medium|True", named);
+    // Without kwargs, silence keeps the server's "low".
+    const plain = try renderChatTemplate(allocator, &messages, &config, null, null, true, null, false);
+    defer allocator.free(plain);
+    try testing.expectEqualStrings("low|", plain);
+    // Thinking off keeps the derived value (inert on this arm).
+    const off = try renderChatTemplateWith(allocator, &messages, &config, null, null, false, null, false, "{}");
+    defer allocator.free(off);
+    try testing.expectEqualStrings("off|", off);
+
+    // The shipped template: the xhigh preamble, as vLLM renders it.
+    config.chat_template = @embedFile("fixtures/qwen38_chat_template.jinja");
+    const real = try renderChatTemplateWith(allocator, &messages, &config, null, null, true, null, false, "{\"preserve_thinking\":true}");
+    defer allocator.free(real);
+    try testing.expect(std.mem.indexOf(u8, real, "Reasoning effort is set to xhigh") != null);
+    try testing.expect(std.mem.indexOf(u8, real, "Reasoning effort is set to low") == null);
 }
 
 test "renderChatTemplate: a render that raises under chat_template_kwargs is an error, not the fallback" {

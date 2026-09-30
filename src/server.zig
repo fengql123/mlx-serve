@@ -7801,6 +7801,33 @@ test "implicitEffortBudget: silence on the Qwen3.8 family gets low's budget" {
     try std.testing.expectEqual(@as(i32, -1), implicitEffortBudget("{{ reasoning_effort }}", true, -1));
 }
 
+/// The reasoning budget a chat request's effort settles, or null for silence
+/// (then `implicitEffortBudgetFor`). With `chat_template_kwargs` an unnamed
+/// effort renders the template's own default, not Qwen3.8's "low" for
+/// silence, so low's implicit budget does not apply: `--reasoning-budget` only.
+fn namedEffortBudget(root: std.json.ObjectMap, effort_cfg: ?ReasoningEffort, default_budget: i32) ?i32 {
+    if (effort_cfg) |e| return e.budget;
+    if (templateKwargsSent(root)) return default_budget;
+    return null;
+}
+
+test "namedEffortBudget: kwargs without an effort skip the implicit Qwen3.8 budget" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, want: ?i32 }{
+        .{ .body = "{}", .want = null },
+        .{ .body = "{\"chat_template_kwargs\":null}", .want = null },
+        .{ .body = "{\"chat_template_kwargs\":{\"enable_thinking\":true,\"preserve_thinking\":true}}", .want = -1 },
+        .{ .body = "{\"reasoning_effort\":\"low\"}", .want = 2048 },
+        .{ .body = "{\"chat_template_kwargs\":{\"reasoning_effort\":\"low\"}}", .want = -1 },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        try std.testing.expectEqual(case.want, namedEffortBudget(root, parseReasoningEffort(root, -1, false), -1));
+    }
+}
+
 fn parseReasoningEffort(root: std.json.ObjectMap, default_budget: i32, template_consumes_effort: bool) ?ReasoningEffort {
     // `chat_template_kwargs.reasoning_effort` is a template variable (vLLM):
     // it picks the rendered effort arm, mapped per family by
@@ -7885,6 +7912,17 @@ fn resolveEnableThinking(root: std.json.ObjectMap, effort_cfg: ?ReasoningEffort,
     return (et orelse false) or (if (effort_cfg) |e| e.enable else false);
 }
 
+/// The default `resolveEnableThinking` falls back to. A request whose
+/// `chat_template_kwargs` object omits `enable_thinking` leaves the variable
+/// undefined on vLLM, so the template's own default applies
+/// (`chat.templateThinkingWhenUndefined`: on, for every Qwen3.x template).
+/// The arch default stands without kwargs, and where the template's default
+/// cannot be read.
+fn thinkingDefault(root: std.json.ObjectMap, chat_template: []const u8, arch_default: bool) bool {
+    if (!templateKwargsSent(root) or templateKwarg(root, "enable_thinking") != null) return arch_default;
+    return chat_mod.templateThinkingWhenUndefined(chat_template) orelse arch_default;
+}
+
 const SchemaThinkingPolicy = enum {
     no_mask,
     token_zero,
@@ -7914,6 +7952,12 @@ fn schemaMasksThinking(
     return .fallback_thinking_off;
 }
 
+/// The request sent `chat_template_kwargs` as a JSON object.
+fn templateKwargsSent(root: std.json.ObjectMap) bool {
+    const kw = root.get("chat_template_kwargs") orelse return false;
+    return kw == .object;
+}
+
 /// One key of the request's `chat_template_kwargs` object, or null (a JSON
 /// null counts as absent, so it never masks the top-level spelling).
 fn templateKwarg(root: std.json.ObjectMap, key: []const u8) ?std.json.Value {
@@ -7931,8 +7975,9 @@ fn templateKwarg(root: std.json.ObjectMap, key: []const u8) ?std.json.Value {
 /// `reasoning_effort` reached `parseReasoningEffort`, whose word
 /// `chat.serializeExtraContext` maps into each family's own vocabulary (a
 /// verbatim overlay would bypass that, and Qwen3.8's template raises on
-/// anything but xhigh|medium|low). Those two must be a bool / a string.
-/// Caller frees.
+/// anything but xhigh|medium|low). Those two must be a bool / a string. An
+/// object left empty is "{}", not null: the render still treats the keys the
+/// client omitted as undefined (`chat.renderChatTemplateWith`). Caller frees.
 fn templateKwargsJson(allocator: std.mem.Allocator, root: std.json.ObjectMap) !?[]u8 {
     const v = root.get("chat_template_kwargs") orelse return null;
     if (v == .null) return null;
@@ -7947,8 +7992,22 @@ fn templateKwargsJson(allocator: std.mem.Allocator, root: std.json.ObjectMap) !?
         if (std.mem.eql(u8, e.key_ptr.*, "reasoning_effort")) continue;
         try kwargs.put(allocator, e.key_ptr.*, e.value_ptr.*);
     }
-    if (kwargs.count() == 0) return null;
     return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = kwargs }, .{});
+}
+
+/// ds4 renders its built-in DeepSeek-V4 encoder, not a Jinja template: of the
+/// `chat_template_kwargs` only `enable_thinking` reaches it (the think mode).
+/// Any other key would be dropped and the prompt would differ from the
+/// template's, so the request is refused instead.
+fn ds4TemplateKwargsRejectReason(root: std.json.ObjectMap) ?[]const u8 {
+    const kw = root.get("chat_template_kwargs") orelse return null;
+    if (kw != .object) return null;
+    var it = kw.object.iterator();
+    while (it.next()) |e| {
+        if (e.value_ptr.* == .null or std.mem.eql(u8, e.key_ptr.*, "enable_thinking")) continue;
+        return "this model is served by the ds4 engine, whose built-in prompt encoder takes only chat_template_kwargs.enable_thinking";
+    }
+    return null;
 }
 
 /// The template raised (or failed) on a request that sent `chat_template_kwargs`.
@@ -8551,7 +8610,12 @@ fn handleChatCompletions(
     // A request naming NEITHER takes the arch default (off for every arch but
     // the ones whose vendor documents thinking-on).
     const effort_cfg = parseReasoningEffort(root, server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok));
-    var enable_thinking = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking(tools_json != null));
+    var enable_thinking = resolveEnableThinking(root, effort_cfg, thinkingDefault(root, chat_config.chat_template, config.defaultEnableThinking(tools_json != null)));
+    if (lm.ds4_engine != null) if (ds4TemplateKwargsRejectReason(root)) |reason| {
+        log.warn("POST /v1/chat/completions -> 400 (chat_template_kwargs on ds4)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+        return;
+    };
     const template_kwargs = templateKwargsJson(allocator, root) catch |err| {
         const reason: []const u8 = switch (err) {
             error.InvalidTemplateKwargs => "'chat_template_kwargs' must be a JSON object",
@@ -8567,7 +8631,7 @@ fn handleChatCompletions(
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
     // explicit reasoning_budget_tokens > effort-mapped budget > --reasoning-budget flag
-    const effort_budget: i32 = if (effort_cfg) |e| e.budget else implicitEffortBudgetFor(allocator, lm, tok);
+    const effort_budget: i32 = namedEffortBudget(root, effort_cfg, server_config.default_reasoning_budget) orelse implicitEffortBudgetFor(allocator, lm, tok);
     const reasoning_budget: i32 = if (root.get("reasoning_budget_tokens")) |v| switch (v) {
         .integer => |i| clampJsonI32(i),
         else => effort_budget,
@@ -12808,9 +12872,8 @@ fn cachedFormatChat(
     // silently doubled assistant turn; the scan below is what stops it
     // shipping.
     if (continue_final and lm.ds4_engine != null) return error.ContinuationUnsupported;
-    if (template_kwargs != null and lm.ds4_engine != null) {
-        log.warn("  chat_template_kwargs ignored: ds4 renders its built-in template (only enable_thinking applies)\n", .{});
-    }
+    // ds4 has no Jinja context: /v1/chat/completions refuses kwargs beyond
+    // enable_thinking there (`ds4TemplateKwargsRejectReason`).
     const ids = if (lm.ds4_engine) |engine|
         try chat_mod.encodeChatViaDs4(allocator, engine, messages, tools_json, tool_choice_instruction, enable_thinking)
     else if (lm.llama_engine) |engine|
@@ -21387,7 +21450,9 @@ test "templateKwargsJson: an object passes through minus the keys the server con
     const cases = [_]struct { body: []const u8, want: ?[]const u8 }{
         .{ .body = "{}", .want = null },
         .{ .body = "{\"chat_template_kwargs\":null}", .want = null },
-        .{ .body = "{\"chat_template_kwargs\":{\"enable_thinking\":true}}", .want = null },
+        // Every key consumed: still "{}", so the render knows kwargs were sent.
+        .{ .body = "{\"chat_template_kwargs\":{\"enable_thinking\":true}}", .want = "{}" },
+        .{ .body = "{\"chat_template_kwargs\":{}}", .want = "{}" },
         // reasoning_effort goes through parseReasoningEffort and the per-family
         // mapping, never verbatim (Qwen3.8 raises on OpenAI's "high").
         .{ .body = "{\"chat_template_kwargs\":{\"enable_thinking\":false,\"thinking\":true,\"reasoning_effort\":\"low\"}}", .want = "{\"thinking\":true}" },
@@ -21412,6 +21477,52 @@ test "templateKwargsJson: an object passes through minus the keys the server con
     const bad_re = try std.json.parseFromSlice(std.json.Value, allocator, "{\"chat_template_kwargs\":{\"reasoning_effort\":2}}", .{});
     defer bad_re.deinit();
     try std.testing.expectError(error.InvalidTemplateReasoningEffort, templateKwargsJson(allocator, bad_re.value.object));
+}
+
+test "thinkingDefault: kwargs that omit enable_thinking take the template's default, as on vLLM" {
+    const allocator = std.testing.allocator;
+    const qwen = "{%- if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>{%- endif %}";
+    const opaque_tpl = "{{ messages }}";
+    const cases = [_]struct { body: []const u8, tpl: []const u8, arch: bool, want: bool }{
+        // No kwargs: the arch default, as before.
+        .{ .body = "{}", .tpl = qwen, .arch = false, .want = false },
+        // Kwargs without enable_thinking: Qwen reads undefined as on.
+        .{ .body = "{\"chat_template_kwargs\":{\"preserve_thinking\":true}}", .tpl = qwen, .arch = false, .want = true },
+        .{ .body = "{\"chat_template_kwargs\":{\"enable_thinking\":null}}", .tpl = qwen, .arch = false, .want = true },
+        // A template whose default can't be read keeps the arch default.
+        .{ .body = "{\"chat_template_kwargs\":{\"preserve_thinking\":true}}", .tpl = opaque_tpl, .arch = false, .want = false },
+        // A named enable_thinking is not a default at all (resolveEnableThinking decides).
+        .{ .body = "{\"chat_template_kwargs\":{\"enable_thinking\":false}}", .tpl = qwen, .arch = false, .want = false },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.want, thinkingDefault(parsed.value.object, case.tpl, case.arch));
+    }
+    // End to end: kwargs with no thinking signal think on a Qwen template;
+    // a top-level signal still decides.
+    const top = try std.json.parseFromSlice(std.json.Value, allocator, "{\"enable_thinking\":false,\"chat_template_kwargs\":{\"preserve_thinking\":true}}", .{});
+    defer top.deinit();
+    try std.testing.expect(!resolveEnableThinking(top.value.object, null, thinkingDefault(top.value.object, qwen, false)));
+    const silent = try std.json.parseFromSlice(std.json.Value, allocator, "{\"chat_template_kwargs\":{\"preserve_thinking\":true}}", .{});
+    defer silent.deinit();
+    try std.testing.expect(resolveEnableThinking(silent.value.object, null, thinkingDefault(silent.value.object, qwen, false)));
+}
+
+test "ds4TemplateKwargsRejectReason: only enable_thinking reaches the ds4 encoder" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, rejected: bool }{
+        .{ .body = "{}", .rejected = false },
+        .{ .body = "{\"chat_template_kwargs\":{\"enable_thinking\":true}}", .rejected = false },
+        .{ .body = "{\"chat_template_kwargs\":{\"enable_thinking\":true,\"reasoning_effort\":null}}", .rejected = false },
+        .{ .body = "{\"chat_template_kwargs\":{\"reasoning_effort\":\"max\"}}", .rejected = true },
+        .{ .body = "{\"chat_template_kwargs\":{\"enable_thinking\":true,\"preserve_thinking\":true}}", .rejected = true },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.rejected, ds4TemplateKwargsRejectReason(parsed.value.object) != null);
+    }
 }
 
 test "parseReasoningEffort: chat_template_kwargs.reasoning_effort picks the arm, derives no budget, and a null does not mask the top level" {
