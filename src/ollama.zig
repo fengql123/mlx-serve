@@ -245,6 +245,15 @@ fn writeMessagesField(allocator: std.mem.Allocator, w: *std.Io.Writer, messages_
             break :blk null;
         });
         if (std.mem.eql(u8, role, "assistant")) {
+            // Ollama's history reasoning is `thinking`; /v1 reads it as
+            // `reasoning_content`, so a template that keeps past reasoning
+            // (preserve_thinking) still has it to render.
+            if (obj.get("thinking")) |tv| {
+                if (tv == .string and tv.string.len > 0) {
+                    try w.writeAll(",\"reasoning_content\":");
+                    try writeJsonString(w, tv.string);
+                }
+            }
             if (obj.get("tool_calls")) |tcv| {
                 if (tcv == .array and tcv.array.items.len > 0) {
                     try w.writeAll(",\"tool_calls\":[");
@@ -1131,6 +1140,27 @@ test "ollama: chat request honors stream:false and maps options" {
     try testing.expectEqualStrings("END", root.get("stop").?.array.items[0].string);
     // num_ctx is deliberately dropped.
     try testing.expect(root.get("num_ctx") == null);
+}
+
+test "ollama: assistant thinking in the history reaches /v1 as reasoning_content" {
+    const allocator = testing.allocator;
+    var tr = try translateChatRequest(allocator,
+        \\{"model":"m","think":true,"chat_template_kwargs":{"preserve_thinking":true},"messages":[
+        \\ {"role":"user","content":"hi"},
+        \\ {"role":"assistant","content":"","thinking":"look it up","tool_calls":[{"function":{"name":"f","arguments":{"q":1}}}]},
+        \\ {"role":"tool","content":"42"},
+        \\ {"role":"assistant","content":"ok","thinking":""},
+        \\ {"role":"user","content":"again","thinking":"not an assistant"}]}
+    );
+    defer tr.deinit(allocator);
+    var parsed = try parseTestJson(allocator, tr.body);
+    defer parsed.deinit();
+    const msgs = parsed.value.object.get("messages").?.array.items;
+    try testing.expectEqualStrings("look it up", msgs[1].object.get("reasoning_content").?.string);
+    try testing.expectEqualStrings("f", msgs[1].object.get("tool_calls").?.array.items[0].object.get("function").?.object.get("name").?.string);
+    // An empty thinking string, and thinking on a non-assistant turn, are not reasoning.
+    try testing.expect(msgs[3].object.get("reasoning_content") == null);
+    try testing.expect(msgs[4].object.get("reasoning_content") == null);
 }
 
 test "ollama: options.ignore_eos and chat_template_kwargs reach the /v1 body (chat and generate)" {
