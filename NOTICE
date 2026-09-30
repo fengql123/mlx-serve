@@ -260,8 +260,10 @@ llama.cpp
 https://github.com/ggml-org/llama.cpp
 Copyright (c) 2023-2026 The ggml authors
 
-Prebuilt release staged into `lib/llama` by `scripts/fetch-llama.sh` and linked
-into the mlx-serve binary as the generic GGUF engine. Unmodified.
+Built from source at the pinned release tag by `scripts/build-llama.sh` (or
+that tag's prebuilt XCFramework, by `scripts/fetch-llama.sh`), staged into
+`lib/llama` and linked into the mlx-serve binary as the generic GGUF engine.
+Unmodified.
 
 --------------------------------------------------------------------------------
 ds4.c

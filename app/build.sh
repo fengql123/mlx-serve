@@ -167,9 +167,10 @@ echo "  Swift binary: $(du -h "$SWIFT_BIN" | cut -f1)"
 # ── Phase 2: Build mlx-serve (Zig) ──
 echo "→ Building mlx-serve (Zig)..."
 cd "$PROJECT_ROOT"
-# Stage libllama (llama.cpp GGUF engine) before the Zig build links against it.
-echo "→ Fetching libllama..."
-bash "$PROJECT_ROOT/scripts/fetch-llama.sh"
+# Stage libllama (llama.cpp GGUF engine) before the Zig build links against it,
+# built from source at the tag scripts/fetch-llama.sh pins. Idempotent.
+echo "→ Building libllama from source..."
+bash "$PROJECT_ROOT/scripts/build-llama.sh"
 # Build the pinned mlx + mlx-c submodules into lib/mlx (NAX kernels enabled —
 # the brew bottle ships without them). Idempotent: no-op when the stage
 # matches the pinned SHAs. Needs full Xcode (Metal Toolchain), so it runs
@@ -368,7 +369,7 @@ if [ "$STAGE_FRAMEWORKS" = "1" ]; then
     done
 
     # libllama (llama.cpp GGUF engine) — single self-contained dylib staged by
-    # scripts/fetch-llama.sh. Bundled + signed exactly like the others.
+    # scripts/build-llama.sh. Bundled + signed exactly like the others.
     [ -f "$PROJECT_ROOT/lib/llama/lib/libllama.dylib" ] && cp "$PROJECT_ROOT/lib/llama/lib/libllama.dylib" "$CONTENTS/Frameworks/"
 
     # SwiftOGG's binary deps: YbridOpus + YbridOgg dynamic frameworks (libopus +

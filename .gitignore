@@ -20,6 +20,8 @@ zig-out/
 # committed onto a branch (7f89301), replacing the lib/ds4 submodule and
 # leaving lib/mlx pointing at itself. Ignore both spellings.
 /lib/llama
+# llama.cpp source + build tree for scripts/build-llama.sh
+/lib/.llama-build/
 
 # mlx + mlx-c, built from the pinned submodules by scripts/build-mlx.sh
 # (lib/mlx-src + lib/mlxc-src are the vendored sources; these are outputs)

@@ -10,7 +10,9 @@
 # bundle + re-sign the dylib exactly like libmlxc.dylib.
 #
 # This is the single source of truth for the pinned llama.cpp version.
-# Bump LLAMA_TAG to upgrade; CI and local builds re-fetch automatically.
+# Bump LLAMA_TAG to upgrade. CI and app/build.sh build this tag FROM SOURCE with
+# scripts/build-llama.sh (same staged layout); this script is the prebuilt
+# alternative.
 set -euo pipefail
 
 LLAMA_TAG="${LLAMA_TAG:-b10809}"

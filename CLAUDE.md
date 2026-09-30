@@ -84,7 +84,8 @@ Sampling defaults for omitted fields: body > launch flags > model `generation_co
 - **ALWAYS `zig build -Doptimize=ReleaseFast`, never bare `zig build`** (Debug 2–4× slower ⇒ fake regressions). `zig build test` does NOT refresh `zig-out/bin/mlx-serve` — rebuild before any live A/B.
 - Swift app: `bash app/build.sh`. The two bundle binaries move together.
 - mlx + mlx-c: submodules built by `scripts/build-mlx.sh` (deployment target 26.2 → NAX kernels; script + `tests/test_mlx_staged_nax.sh` ASSERT `*_nax` in the metallib). Min macOS 26.2. Bump = checkout tag → rerun → re-diff `src/mlx.zig` externs. Brew: webp ≥ 1.6.0.
-- Rebuild Jinja after `lib/jinja_cpp/*.cpp` changes: compile the 7 `.cpp` (`clang++ -std=c++17 -O2 -DNDEBUG -I .`) into `obj/` and `ar rcs libjinja.a obj/*.o`.
+- Rebuild Jinja after `lib/jinja_cpp/*.cpp` changes: `scripts/build-jinja.sh` (compiles the 7 `.cpp` with `clang++ -std=c++17 -O2 -DNDEBUG -I .` into `obj/`, then a fresh `ar rcs libjinja.a obj/*.o`).
+- libllama: `scripts/build-llama.sh` builds the tag pinned in `scripts/fetch-llama.sh` from source (Metal, embedded shaders) into `lib/llama/`; `fetch-llama.sh` stages the same tag's prebuilt XCFramework.
 
 ## Testing — TDD is mandatory
 

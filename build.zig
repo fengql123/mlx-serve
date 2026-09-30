@@ -99,7 +99,7 @@ pub fn build(b: *std.Build) void {
     //                    lib/mlx/.version stamp (written by scripts/build-mlx.sh)
     //   --ds4-commit     pinned ds4 submodule short commit (build.sh: `git rev-parse`)
     //   --llama-tag      llama.cpp release tag; defaults from lib/llama/.version
-    //                    (written by scripts/fetch-llama.sh) so a plain dev build
+    //                    (written by scripts/build-llama.sh / fetch-llama.sh) so a plain dev build
     //                    still reports it. app/build.sh passes all three.
     const mlx_c_version = b.option([]const u8, "mlx-c-version", "Pinned mlx-c version") orelse readMlxcPin(b) orelse "unknown";
     const ds4_commit = b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse "unknown";
@@ -155,7 +155,8 @@ pub fn build(b: *std.Build) void {
 
     // Jinja2 template engine (from llama.cpp's common/jinja + nlohmann/json).
     // Pre-compiled as a static library with system clang++ (C++17 requires system libc++).
-    // Rebuild with: cd lib/jinja_cpp && for f in jinja_wrapper caps lexer parser runtime jinja_string value; do clang++ -std=c++17 -O2 -DNDEBUG -I . -c $f.cpp -o obj/$f.o; done && ar rcs libjinja.a obj/*.o
+    // Rebuild from the in-tree sources with scripts/build-jinja.sh (clang++ -std=c++17 -O2 -DNDEBUG
+    // per .cpp into obj/, then a fresh `ar rcs libjinja.a obj/*.o`).
     mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
     mod.addIncludePath(b.path("lib/jinja_cpp"));
 
@@ -185,8 +186,9 @@ pub fn build(b: *std.Build) void {
     addAneSources(b, mod);
 
     // llama.cpp libllama for generic GGUF models (Metal backend, macOS only).
-    // Staged by `scripts/fetch-llama.sh` into lib/llama/ (a single self-contained
-    // dylib + headers extracted from the pinned XCFramework). See src/arch/llama.zig.
+    // Staged into lib/llama/ (a single self-contained dylib + headers) by
+    // `scripts/build-llama.sh` from source at the tag `scripts/fetch-llama.sh`
+    // pins, or by fetch-llama.sh from that tag's XCFramework. See src/arch/llama.zig.
     addLlamaLib(b, mod);
 
     // mlx + mlx-c: self-built from the pinned submodules (lib/mlx-src,
@@ -709,7 +711,7 @@ fn buildRootHandle(b: *std.Build) std.Io.Dir {
     return b.root.root_dir.handle;
 }
 
-/// The llama.cpp tag staged by scripts/fetch-llama.sh (it writes LLAMA_TAG to
+/// The llama.cpp tag staged by scripts/build-llama.sh or fetch-llama.sh (both write LLAMA_TAG to
 /// `lib/llama/.version`). Read at configure time so a plain `zig build` reports
 /// the real tag without app/build.sh having to pass `--llama-tag`. Returns null
 /// (→ "unknown") when llama hasn't been fetched yet.
@@ -725,7 +727,7 @@ fn readLlamaTag(b: *std.Build) ?[]const u8 {
 }
 
 fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
-    // Link the prebuilt libllama staged by scripts/fetch-llama.sh. The dylib's
+    // Link the libllama staged by scripts/build-llama.sh (or fetch-llama.sh). The dylib's
     // install-name is @rpath/libllama.dylib; we add an rpath to its build-tree
     // location so `zig build run` / unit tests resolve it in dev. The app bundle
     // and CLI tarball rewrite that reference to @executable_path/... and re-sign

@@ -183,8 +183,8 @@ jobs:
           git tag "$TAG"
           git push --force origin "$TAG"
 
-      - name: Fetch libllama (llama.cpp GGUF engine)
-        run: bash scripts/fetch-llama.sh
+      - name: Build libllama from source (llama.cpp GGUF engine)
+        run: bash scripts/build-llama.sh
 
       # Same key as ci.yml, so a tag build restores what main's CI already compiled.
       - name: Cache Zig build artifacts
@@ -280,7 +280,7 @@ jobs:
           [ -f "$WEBP_LIB/libsharpyuv.dylib" ] && cp "$WEBP_LIB/libsharpyuv.dylib" "$STAGING/lib/"
 
           # libllama (llama.cpp GGUF engine) — single self-contained dylib staged
-          # by scripts/fetch-llama.sh, install-name @rpath/libllama.dylib.
+          # by scripts/build-llama.sh, install-name @rpath/libllama.dylib.
           [ -f "lib/llama/lib/libllama.dylib" ] && cp "lib/llama/lib/libllama.dylib" "$STAGING/lib/"
 
           install_name_tool -change \
@@ -408,7 +408,7 @@ jobs:
           [ -f "$WEBP_LIB/libsharpyuv.dylib" ] && cp "$WEBP_LIB/libsharpyuv.dylib" "$CONTENTS/Frameworks/"
 
           # libllama (llama.cpp GGUF engine) — single self-contained dylib staged
-          # by scripts/fetch-llama.sh, install-name @rpath/libllama.dylib.
+          # by scripts/build-llama.sh, install-name @rpath/libllama.dylib.
           [ -f "lib/llama/lib/libllama.dylib" ] && cp "lib/llama/lib/libllama.dylib" "$CONTENTS/Frameworks/"
 
           # YbridOpus + YbridOgg dynamic frameworks (libopus/libogg) pulled by the
