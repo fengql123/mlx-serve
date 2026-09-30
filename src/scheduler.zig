@@ -5704,9 +5704,12 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
         return;
     }
     const tok_u32: u32 = @intCast(next_id);
+    // -1 matches no token, so under ignore_eos neither this tick nor ds4's
+    // speculative cycle stops at the engine's EOS.
+    const eos: i32 = if (slot.sampling.ignore_eos) -1 else engine.eosToken();
 
     // EOS handling — match the MLX path: do NOT emit the stop token.
-    if (next_id == engine.eosToken() or generate_mod.isEosId(tok_u32, slot.eos_token_ids)) {
+    if (next_id == eos or generate_mod.isEosId(tok_u32, slot.eos_token_ids)) {
         finishSlot(sch, slot, "stop");
         return;
     }
@@ -5721,9 +5724,9 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
         const cap: i64 = @intCast(slot.max_tokens);
         const remaining: i32 = @intCast(@max(@as(i64, 1), cap - done));
         const spec = if (slot.sampling.temperature <= 0.0)
-            session.evalSpeculative(next_id, remaining, engine.eosToken(), spec_buf[0..])
+            session.evalSpeculative(next_id, remaining, eos, spec_buf[0..])
         else
-            session.evalSpeculativeSampled(next_id, remaining, engine.eosToken(), slot.sampling.temperature, @intCast(slot.sampling.top_k), slot.sampling.top_p, 0.05, &slot.ds4_rng, spec_buf[0..]);
+            session.evalSpeculativeSampled(next_id, remaining, eos, slot.sampling.temperature, @intCast(slot.sampling.top_k), slot.sampling.top_p, 0.05, &slot.ds4_rng, spec_buf[0..]);
         const n = spec catch {
             session.invalidate();
             slot.markError("ds4_spec_failed");
@@ -5733,7 +5736,7 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
         for (spec_buf[0..n_usize]) |t| {
             const t_u32: u32 = @intCast(t);
             // EOS may appear mid-batch — stop, and never emit it.
-            if (t == engine.eosToken() or generate_mod.isEosId(t_u32, slot.eos_token_ids)) {
+            if (t == eos or generate_mod.isEosId(t_u32, slot.eos_token_ids)) {
                 finishSlot(sch, slot, "stop");
                 return;
             }
@@ -5809,7 +5812,7 @@ fn runLlamaDecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_llama.LlamaSe
     const tok_u32: u32 = @intCast(next_id);
 
     // EOS / end-of-generation — like the MLX path, do NOT emit the stop token.
-    if (engine.isEog(next_id) or generate_mod.isEosId(tok_u32, slot.eos_token_ids)) {
+    if ((engine.isEog(next_id) and !slot.sampling.ignore_eos) or generate_mod.isEosId(tok_u32, slot.eos_token_ids)) {
         finishSlot(sch, slot, "stop");
         return;
     }
@@ -6990,7 +6993,8 @@ fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     // halts it until the cap. Checked here, before this tick's step, so it
     // covers the regular, PLD, and drafter paths uniformly.
     const loop_guard_start = gen.loopGuardStart();
-    if (loopStopDecision(gen.generated_ids.items[loop_guard_start..])) |relative_stop| {
+    const loop_stop = if (gen.sampling.ignore_eos) null else loopStopDecision(gen.generated_ids.items[loop_guard_start..]);
+    if (loop_stop) |relative_stop| {
         if (gen.hasPrePayloadConstraint()) {
             switch (try gen.forceConstraintTransition(slot.allocator)) {
                 .committed => |boundary| {
@@ -8696,7 +8700,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
         }
         if (gen.next_token_id == 0) {
             gen.consecutive_pad += 1;
-            if (gen.consecutive_pad >= 3) {
+            if (gen.consecutive_pad >= 3 and !slot.sampling.ignore_eos) {
                 finishSlot(sch, slot, "stop");
                 continue;
             }

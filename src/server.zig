@@ -8036,6 +8036,21 @@ fn nChoicesRejectReason(root: std.json.ObjectMap) ?[]const u8 {
     return "'n' > 1 is not supported: this server returns a single choice per request; omit 'n' or set it to 1";
 }
 
+/// vLLM's `ignore_eos`: only `max_tokens` ends the turn. No stop id, `stop`
+/// string, pad run or repetition-loop cut ends it early, so a replay gets
+/// exactly the output length it names.
+fn parseIgnoreEos(root: std.json.ObjectMap) bool {
+    const v = root.get("ignore_eos") orelse return false;
+    return v == .bool and v.bool;
+}
+
+/// Why an `ignore_eos` request cannot generate exactly its `max_tokens`, or null.
+fn ignoreEosRejectReason(max_tokens: u32, effective_max_tokens: u32) ?[]const u8 {
+    if (max_tokens == AUTO_MAX_TOKENS_SENTINEL) return "ignore_eos requires max_tokens (or max_completion_tokens): without a stop token the output length must be named";
+    if (effective_max_tokens < max_tokens) return "ignore_eos: the prompt plus max_tokens exceeds the context window, so exactly max_tokens tokens cannot be generated";
+    return null;
+}
+
 fn handleChatCompletions(
     allocator: std.mem.Allocator,
     stream: *Conn,
@@ -8277,6 +8292,7 @@ fn handleChatCompletions(
     const max_tokens_origin = maxTokensOrigin(requested_max_tokens, launchMaxTokensDefault());
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
+    const ignore_eos = parseIgnoreEos(root);
 
     const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
@@ -8369,6 +8385,7 @@ fn handleChatCompletions(
             else => {},
         }
     }
+    if (ignore_eos) stop_sequences.clearRetainingCapacity();
 
     // Parse model name from request (use for response, fallback to config)
     const model_name = if (root.get("model")) |v|
@@ -8699,6 +8716,11 @@ fn handleChatCompletions(
     // Clamp max_tokens first: the memory guard bills the reserved generation headroom, and an
     // omitted max_tokens is the maxInt(u32)/4 sentinel.
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
+    if (ignore_eos) if (ignoreEosRejectReason(max_tokens, effective_max_tokens)) |reason| {
+        log.warn("POST /v1/chat/completions -> 400 (ignore_eos without a reachable max_tokens)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+        return;
+    };
 
     // Check if attention computation would exceed GPU memory.
     if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null), enable_mtp)) return;
@@ -8752,7 +8774,8 @@ fn handleChatCompletions(
     // Prompt caching: reuse KV cache for shared prefix.
     // Force invalidation when images are present — image tokens have identical IDs
     // but different vision embeddings, so prefix matching would reuse stale features.
-    const eos_slice = config.eosTokenSlice();
+    const eos_slice: []const u32 = if (ignore_eos) &.{} else config.eosTokenSlice();
+    if (ignore_eos) log.info("  ignore_eos=true (exactly {d} tokens)\n", .{effective_max_tokens});
 
     var sampling = generate_mod.SamplingParams{
         .temperature = temperature,
@@ -8761,6 +8784,7 @@ fn handleChatCompletions(
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty,
         .seed = seed,
+        .ignore_eos = ignore_eos,
     };
 
     // Build grammar-constrained sampling state if a JSON schema was supplied.
@@ -8881,6 +8905,7 @@ fn handleCompletions(
     const max_tokens_origin = maxTokensOrigin(requested_max_tokens, launchMaxTokensDefault());
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
+    const ignore_eos = parseIgnoreEos(root);
 
     const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
@@ -8920,6 +8945,7 @@ fn handleCompletions(
             else => {},
         }
     }
+    if (ignore_eos) stop_sequences.clearRetainingCapacity();
 
     const model_name = if (root.get("model")) |v|
         (if (v == .string) v.string else config.model_type)
@@ -8984,6 +9010,11 @@ fn handleCompletions(
     // Clamp max_tokens first: the memory guard bills the reserved generation headroom, and an
     // omitted max_tokens is the maxInt(u32)/4 sentinel.
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
+    if (ignore_eos) if (ignoreEosRejectReason(max_tokens, effective_max_tokens)) |reason| {
+        log.warn("POST /v1/completions -> 400 (ignore_eos without a reachable max_tokens)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+        return;
+    };
 
     // Check if attention computation would exceed GPU memory.
     if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, null, lm, false, enable_mtp)) return;
@@ -9013,7 +9044,8 @@ fn handleCompletions(
         // chat-completions site): MTP wins whenever loaded.
     }
 
-    const eos_slice = config.eosTokenSlice();
+    const eos_slice: []const u32 = if (ignore_eos) &.{} else config.eosTokenSlice();
+    if (ignore_eos) log.info("  ignore_eos=true (exactly {d} tokens)\n", .{effective_max_tokens});
     const sampling = generate_mod.SamplingParams{
         .temperature = temperature,
         .top_p = top_p,
@@ -9021,6 +9053,7 @@ fn handleCompletions(
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty_c,
         .seed = seed,
+        .ignore_eos = ignore_eos,
     };
 
     if (is_stream) {
@@ -21206,6 +21239,25 @@ test "loopTrimmedIds: the degenerate span is cut, and a bad index degrades to em
     // must emit everything rather than slice out of bounds.
     try std.testing.expectEqualSlices(u32, &ids, loopTrimmedIds(&ids, 5));
     try std.testing.expectEqualSlices(u32, &ids, loopTrimmedIds(&ids, 99));
+}
+
+test "ignore_eos: only a JSON true arms it, and it needs a max_tokens that fits" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, want: bool }{
+        .{ .body = "{}", .want = false },
+        .{ .body = "{\"ignore_eos\":false}", .want = false },
+        .{ .body = "{\"ignore_eos\":\"true\"}", .want = false },
+        .{ .body = "{\"ignore_eos\":true}", .want = true },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.want, parseIgnoreEos(parsed.value.object));
+    }
+    try std.testing.expect(ignoreEosRejectReason(256, 256) == null);
+    // Omitted max_tokens (the auto sentinel) and a context-clamped cap both 400.
+    try std.testing.expect(ignoreEosRejectReason(AUTO_MAX_TOKENS_SENTINEL, 4000) != null);
+    try std.testing.expect(ignoreEosRejectReason(512, 300) != null);
 }
 
 test "nChoicesRejectReason: n>1 earns an honest 400, single-choice spellings pass" {

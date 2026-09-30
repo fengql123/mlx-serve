@@ -751,6 +751,10 @@ pub const SamplingParams = struct {
     /// sampling policy. Null = no suppression (kill switch, no-template
     /// models, every non-suppressing arch).
     suppress_mask: ?mlx.mlx_array = null,
+    /// vLLM `ignore_eos`: only `max_tokens` ends the turn. The server hands
+    /// such a request an empty stop-id set; this flag turns off the stops
+    /// that are not ids (pad runs, the repetition-loop cut, engine EOG).
+    ignore_eos: bool = false,
 };
 
 /// Build the `[vocab]` bool suppression mask (true = never sample) on the
@@ -10674,7 +10678,7 @@ pub const Generator = struct {
         }
         if (token == 0) {
             self.consecutive_pad += 1;
-            if (self.consecutive_pad >= 3) {
+            if (self.consecutive_pad >= 3 and !self.sampling.ignore_eos) {
                 _ = mlx.mlx_array_free(step_logits);
                 owns_step_logits = false;
                 switch (try self.forceConstraintTransition(allocator)) {
@@ -10789,7 +10793,7 @@ pub const Generator = struct {
         }
         if (token == 0) {
             self.consecutive_pad += 1;
-            if (self.consecutive_pad >= 3) {
+            if (self.consecutive_pad >= 3 and !self.sampling.ignore_eos) {
                 self.done = true;
                 self.finish_reason = "stop";
                 return null;
@@ -10938,7 +10942,7 @@ pub const Generator = struct {
         }
         if (token == 0) {
             self.consecutive_pad += 1;
-            if (self.consecutive_pad >= 3) {
+            if (self.consecutive_pad >= 3 and !self.sampling.ignore_eos) {
                 if (next_logits) |nl| _ = mlx.mlx_array_free(nl);
                 self.done = true;
                 self.finish_reason = "stop";
@@ -11003,7 +11007,7 @@ pub const Generator = struct {
             self.finish_reason = "length";
             return true;
         }
-        if (tokenStops(self.next_token_id, self.eos_token_ids, &self.consecutive_pad)) {
+        if (tokenStops(self.next_token_id, self.eos_token_ids, self.sampling.ignore_eos, &self.consecutive_pad)) {
             self.done = true;
             self.finish_reason = "stop";
             return true;
@@ -12317,14 +12321,15 @@ pub fn isEosId(id: u32, eos: []const u32) bool {
 }
 
 /// Token-only stop conditions of `checkStop`; `consecutive_pad` is carried state reset by any real token.
-pub fn tokenStops(next_token_id: u32, eos_token_ids: []const u32, consecutive_pad: *u32) bool {
-    if (isEosId(next_token_id, eos_token_ids)) return true;
+/// `ignore_eos` disables both: the turn then ends only at `max_tokens`.
+pub fn tokenStops(next_token_id: u32, eos_token_ids: []const u32, ignore_eos: bool, consecutive_pad: *u32) bool {
+    if (!ignore_eos and isEosId(next_token_id, eos_token_ids)) return true;
     if (next_token_id != 0) {
         consecutive_pad.* = 0;
         return false;
     }
     consecutive_pad.* += 1;
-    return consecutive_pad.* >= 3;
+    return consecutive_pad.* >= 3 and !ignore_eos;
 }
 
 /// Max cycle length (in tokens) scanned by `isDegenerateTailLoop`, and how many
@@ -18466,19 +18471,29 @@ test "a block decoder's entry token stops the round before it drafts" {
     // Bar: an EOS or third pad as the round's entry token ends the request before any draft.
     const eos = [_]u32{ 151645, 151643 };
     var pad: u32 = 0;
-    try testing.expect(tokenStops(151645, &eos, &pad));
-    try testing.expect(tokenStops(151643, &eos, &pad));
-    try testing.expect(!tokenStops(17, &eos, &pad));
+    try testing.expect(tokenStops(151645, &eos, false, &pad));
+    try testing.expect(tokenStops(151643, &eos, false, &pad));
+    try testing.expect(!tokenStops(17, &eos, false, &pad));
 
     // A pad run stops on the third; any real token resets it.
     pad = 0;
-    try testing.expect(!tokenStops(0, &eos, &pad));
-    try testing.expect(!tokenStops(0, &eos, &pad));
-    try testing.expect(tokenStops(0, &eos, &pad));
+    try testing.expect(!tokenStops(0, &eos, false, &pad));
+    try testing.expect(!tokenStops(0, &eos, false, &pad));
+    try testing.expect(tokenStops(0, &eos, false, &pad));
     pad = 0;
-    try testing.expect(!tokenStops(0, &eos, &pad));
-    try testing.expect(!tokenStops(9, &eos, &pad));
+    try testing.expect(!tokenStops(0, &eos, false, &pad));
+    try testing.expect(!tokenStops(9, &eos, false, &pad));
     try testing.expectEqual(@as(u32, 0), pad);
+}
+
+test "ignore_eos: neither an EOS id nor a pad run stops the turn" {
+    // Bar: under ignore_eos only max_tokens ends generation.
+    const eos = [_]u32{ 151645, 151643 };
+    var pad: u32 = 0;
+    try testing.expect(!tokenStops(151645, &eos, true, &pad));
+    for (0..8) |_| try testing.expect(!tokenStops(0, &eos, true, &pad));
+    const defaults = SamplingParams{};
+    try testing.expect(!defaults.ignore_eos);
 }
 
 test "group acceptance: every row's verdict comes from its OWN am, at any accept position" {
