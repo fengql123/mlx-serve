@@ -369,8 +369,10 @@ pub fn formatChat(
     effort: ?[]const u8,
     /// Extend the trailing assistant message instead of answering after it.
     continue_final: bool,
+    /// Client `chat_template_kwargs` as a JSON object (see `renderChatTemplateWith`).
+    template_kwargs: ?[]const u8,
 ) ![]u32 {
-    const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
+    const rendered = try renderChatTemplateWith(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final, template_kwargs);
     defer allocator.free(rendered);
 
 
@@ -533,8 +535,10 @@ pub fn encodeChatViaLlama(
     effort: ?[]const u8,
     /// Extend the trailing assistant message instead of answering after it.
     continue_final: bool,
+    /// Client `chat_template_kwargs` as a JSON object (see `renderChatTemplateWith`).
+    template_kwargs: ?[]const u8,
 ) ![]u32 {
-    const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
+    const rendered = try renderChatTemplateWith(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final, template_kwargs);
     defer allocator.free(rendered);
 
     const i32_ids = try engine.tokenizeText(allocator, rendered, false);
@@ -576,9 +580,25 @@ fn renderChatTemplate(
     tool_choice_instruction: ?[]const u8,
     enable_thinking: bool,
     effort: ?[]const u8,
+    continue_final: bool,
+) ![]const u8 {
+    return renderChatTemplateWith(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final, null);
+}
+
+fn renderChatTemplateWith(
+    allocator: std.mem.Allocator,
+    messages: []const Message,
+    chat_config: *const ChatConfig,
+    tools_json: ?[]const u8,
+    tool_choice_instruction: ?[]const u8,
+    enable_thinking: bool,
+    effort: ?[]const u8,
     /// Extend the trailing assistant message instead of answering after it —
     /// the prompt ends mid-turn and generation resumes from its last word.
     continue_final: bool,
+    /// Client `chat_template_kwargs`, a JSON object overlaid on the Jinja
+    /// context after the server's own keys, so an explicit key wins.
+    template_kwargs: ?[]const u8,
 ) ![]const u8 {
     // Split the partial reply off FIRST, so every transform below (tool
     // fallback synthesis, muse's reasoning drop) sees exactly the message list
@@ -666,8 +686,13 @@ fn renderChatTemplate(
     defer allocator.free(messages_json);
 
     // Build extra context (bos_token, eos_token, enable_thinking, effort)
-    const extra_json = try serializeExtraContext(allocator, chat_config, enable_thinking, effort);
+    var extra_json = try serializeExtraContext(allocator, chat_config, enable_thinking, effort);
     defer allocator.free(extra_json);
+    if (template_kwargs) |kwargs| {
+        const merged = try overlayTemplateKwargs(allocator, extra_json, kwargs);
+        allocator.free(extra_json);
+        extra_json = merged;
+    }
 
     // Null-terminate strings for C
     const tmpl_z = try allocator.dupeSentinel(u8, chat_config.chat_template, 0);
@@ -1133,6 +1158,20 @@ fn k2EffortFor(effort: ?[]const u8) []const u8 {
     if (std.mem.eql(u8, e, "medium")) return "medium";
     if (std.mem.eql(u8, e, "low") or std.mem.eql(u8, e, "minimal") or std.mem.eql(u8, e, "none")) return "low";
     return "high";
+}
+
+/// Overlay `kwargs` (a JSON object) on the extra-context object `base`; a key
+/// in both takes the kwargs value. Caller frees the result.
+pub fn overlayTemplateKwargs(allocator: std.mem.Allocator, base: []const u8, kwargs: []const u8) ![]const u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var merged = try std.json.parseFromSliceLeaky(std.json.Value, a, base, .{});
+    const extra = try std.json.parseFromSliceLeaky(std.json.Value, a, kwargs, .{});
+    if (merged != .object or extra != .object) return error.InvalidTemplateKwargs;
+    var it = extra.object.iterator();
+    while (it.next()) |e| try merged.object.put(a, e.key_ptr.*, e.value_ptr.*);
+    return std.json.Stringify.valueAlloc(allocator, merged, .{});
 }
 
 /// `effort` is the client's raw `reasoning_effort` string (null when the
@@ -9543,6 +9582,32 @@ test "renderChatTemplate: |min picks the smaller element, |max the larger" {
     const rendered = try renderChatTemplate(allocator, &messages, &config, "[]", null, false, null, false);
     defer allocator.free(rendered);
     try testing.expect(std.mem.indexOf(u8, rendered, "1/3") != null);
+}
+
+test "overlayTemplateKwargs: a client key wins over the server's, others pass through" {
+    const allocator = testing.allocator;
+    const merged = try overlayTemplateKwargs(allocator, "{\"eos_token\":\"</s>\",\"reasoning_effort\":\"no_think\"}", "{\"reasoning_effort\":\"low\",\"custom\":[1,true]}");
+    defer allocator.free(merged);
+    try testing.expectEqualStrings("{\"eos_token\":\"</s>\",\"reasoning_effort\":\"low\",\"custom\":[1,true]}", merged);
+    try testing.expectError(error.InvalidTemplateKwargs, overlayTemplateKwargs(allocator, "{}", "[1]"));
+}
+
+test "renderChatTemplate: chat_template_kwargs reach the Jinja context and override derived keys" {
+    const allocator = testing.allocator;
+    var config = ChatConfig{
+        .chat_template = "{{ reasoning_effort }}|{{ custom_flag }}|{{ enable_thinking }}",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+    const plain = try renderChatTemplate(allocator, &messages, &config, null, null, false, null, false);
+    defer allocator.free(plain);
+    try testing.expectEqualStrings("no_think||False", plain);
+    const with = try renderChatTemplateWith(allocator, &messages, &config, null, null, false, null, false, "{\"reasoning_effort\":\"low\",\"custom_flag\":\"on\"}");
+    defer allocator.free(with);
+    try testing.expectEqualStrings("low|on|False", with);
 }
 
 test "renderChatTemplate: REAL Hy3 chat_template.jinja renders without fallback (HY3_MODEL_DIR)" {

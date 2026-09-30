@@ -7802,7 +7802,7 @@ test "implicitEffortBudget: silence on the Qwen3.8 family gets low's budget" {
 }
 
 fn parseReasoningEffort(root: std.json.ObjectMap, default_budget: i32, template_consumes_effort: bool) ?ReasoningEffort {
-    const v = root.get("reasoning_effort") orelse return null;
+    const v = templateKwarg(root, "reasoning_effort") orelse root.get("reasoning_effort") orelse return null;
     if (v != .string) return null;
     return reasoningEffortFromWord(v.string, default_budget, template_consumes_effort);
 }
@@ -7865,8 +7865,11 @@ fn parseAnthropicOutputConfig(root: std.json.ObjectMap) AnthropicOutputConfig {
 /// ("none" being an explicit OFF). Only a request that names NEITHER falls
 /// through to the arch default (`ModelConfig.defaultEnableThinking`).
 ///
-/// The two knobs stay OR'd when both are present, as they always were.
+/// The two knobs stay OR'd when both are present, as they always were. A
+/// `chat_template_kwargs.enable_thinking` bool is the most explicit of all and
+/// decides alone.
 fn resolveEnableThinking(root: std.json.ObjectMap, effort_cfg: ?ReasoningEffort, arch_default: bool) bool {
+    if (templateKwarg(root, "enable_thinking")) |v| if (v == .bool) return v.bool;
     const et: ?bool = if (root.get("enable_thinking")) |v|
         (if (v == .bool) v.bool else null)
     else
@@ -7902,6 +7905,33 @@ fn schemaMasksThinking(
     if (has_finite_reasoning_budget) return .fallback_thinking_off;
     if (protocol_ready) return .deferred;
     return .fallback_thinking_off;
+}
+
+/// One key of the request's `chat_template_kwargs` object, or null.
+fn templateKwarg(root: std.json.ObjectMap, key: []const u8) ?std.json.Value {
+    const kw = root.get("chat_template_kwargs") orelse return null;
+    if (kw != .object) return null;
+    return kw.object.get(key);
+}
+
+/// `chat_template_kwargs` (vLLM/SGLang): extra Jinja variables, re-serialized
+/// for the render and the tokenize-cache key; each key wins over the value the
+/// server derives. `enable_thinking` is left out: it already decided
+/// `resolveEnableThinking`, and the server's resolved flag is what the think
+/// parser and the family-specific rendering must agree on. Caller frees.
+fn templateKwargsJson(allocator: std.mem.Allocator, root: std.json.ObjectMap) !?[]u8 {
+    const v = root.get("chat_template_kwargs") orelse return null;
+    if (v == .null) return null;
+    if (v != .object) return error.InvalidTemplateKwargs;
+    var kwargs: std.json.ObjectMap = .empty;
+    defer kwargs.deinit(allocator);
+    var it = v.object.iterator();
+    while (it.next()) |e| {
+        if (std.mem.eql(u8, e.key_ptr.*, "enable_thinking")) continue;
+        try kwargs.put(allocator, e.key_ptr.*, e.value_ptr.*);
+    }
+    if (kwargs.count() == 0) return null;
+    return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = kwargs }, .{});
 }
 
 /// `continue_final_message`: extend the trailing assistant message instead of
@@ -8486,6 +8516,15 @@ fn handleChatCompletions(
     // the ones whose vendor documents thinking-on).
     const effort_cfg = parseReasoningEffort(root, server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok));
     var enable_thinking = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking(tools_json != null));
+    const template_kwargs = templateKwargsJson(allocator, root) catch |err| switch (err) {
+        error.InvalidTemplateKwargs => {
+            log.warn("POST /v1/chat/completions -> 400 (chat_template_kwargs is not an object)\n", .{});
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'chat_template_kwargs' must be a JSON object", 400);
+            return;
+        },
+        else => return err,
+    };
+    defer if (template_kwargs) |k| allocator.free(k);
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
     // explicit reasoning_budget_tokens > effort-mapped budget > --reasoning-budget flag
@@ -8629,7 +8668,7 @@ fn handleChatCompletions(
     };
     const active_media = activeTurnMediaMessage(messages.items, continue_final);
     var tokenize_sw = Stopwatch.init(stream.io);
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, if (effort_cfg) |e| e.effort else null, continue_final);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, if (effort_cfg) |e| e.effort else null, continue_final, template_kwargs);
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
     if (grammar_schema_val != null and !has_tools and enable_thinking and reasoning_budget < 0) {
@@ -8647,7 +8686,7 @@ fn handleChatCompletions(
             schema_proto_active = false;
             allocator.free(prompt_ids_raw);
             enable_thinking = false;
-            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, tools_json, tool_choice_instruction, false, if (effort_cfg) |e| e.effort else null, continue_final);
+            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, tools_json, tool_choice_instruction, false, if (effort_cfg) |e| e.effort else null, continue_final, template_kwargs);
             log.info("[grammar] {s}; rerendered with thinking off\n", .{if (reasoning_budget >= 0) "finite reasoning budget" else "reasoning protocol unsupported for this model/prompt"});
         },
         .no_mask, .token_zero => schema_proto_active = false,
@@ -12702,10 +12741,12 @@ fn cachedFormatChat(
     reasoning_effort: ?[]const u8,
     /// Extend the trailing assistant message rather than answering after it.
     continue_final: bool,
+    /// Client `chat_template_kwargs` JSON object (`templateKwargsJson`), or null.
+    template_kwargs: ?[]const u8,
 ) ![]u32 {
     const cache_ptr: ?*tokenize_cache_mod.TokenizeCache = if (lm.tokenize_cache) |*tc| tc else null;
     const key_opt: ?u64 = if (cache_ptr != null)
-        tokenize_cache_mod.TokenizeCache.keyFor(messages, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final)
+        tokenize_cache_mod.TokenizeCache.keyFor(messages, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final, template_kwargs)
     else
         null;
     if (cache_ptr) |cache| if (key_opt) |key| {
@@ -12722,12 +12763,15 @@ fn cachedFormatChat(
     // silently doubled assistant turn; the scan below is what stops it
     // shipping.
     if (continue_final and lm.ds4_engine != null) return error.ContinuationUnsupported;
+    if (template_kwargs != null and lm.ds4_engine != null) {
+        log.warn("  chat_template_kwargs ignored: ds4 renders its built-in template (only enable_thinking applies)\n", .{});
+    }
     const ids = if (lm.ds4_engine) |engine|
         try chat_mod.encodeChatViaDs4(allocator, engine, messages, tools_json, tool_choice_instruction, enable_thinking)
     else if (lm.llama_engine) |engine|
-        try chat_mod.encodeChatViaLlama(allocator, engine, chat_config, messages, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final)
+        try chat_mod.encodeChatViaLlama(allocator, engine, chat_config, messages, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final, template_kwargs)
     else
-        try chat_mod.formatChat(allocator, tok, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final);
+        try chat_mod.formatChat(allocator, tok, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final, template_kwargs);
     if (cache_ptr) |cache| if (key_opt) |key| {
         // Insert is best-effort; an OOM in the cache shouldn't fail the
         // request — the user already has their tokenized prompt.
@@ -15465,7 +15509,7 @@ fn handleAnthropicMessages(
     // The `thinking` budget object carries no effort string, but
     // `output_config.effort` does — templates that read the word (dsv4,
     // qwen3.8) get it; requests without one still render their default.
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking, effort_word, continue_final);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking, effort_word, continue_final, null);
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
     if (output_cfg.schema != null and !has_tools and enable_thinking and reasoning_budget < 0) {
@@ -15483,7 +15527,7 @@ fn handleAnthropicMessages(
             schema_proto_active = false;
             allocator.free(prompt_ids_raw);
             enable_thinking = false;
-            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, false, effort_word, continue_final);
+            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, false, effort_word, continue_final, null);
             log.info("[grammar] {s}; rerendered with thinking off\n", .{if (reasoning_budget >= 0) "finite reasoning budget" else "reasoning protocol unsupported for this model/prompt"});
         },
         .no_mask, .token_zero => schema_proto_active = false,
@@ -17221,7 +17265,7 @@ fn handleResponsesInner(
     // cache as chat-completions / messages because they all hash the
     // same canonical (messages, tools, flags) tuple.
     var tokenize_sw = Stopwatch.init(stream.io);
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, reasoning_cfg.effort, false);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, reasoning_cfg.effort, false, null);
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
     if (grammar_schema_val != null and !active_has_tools and enable_thinking) {
@@ -17239,7 +17283,7 @@ fn handleResponsesInner(
             schema_proto_active = false;
             allocator.free(prompt_ids_raw);
             enable_thinking = false;
-            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, false, reasoning_cfg.effort, false);
+            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, false, reasoning_cfg.effort, false, null);
             log.info("[grammar] reasoning protocol unsupported for this model/prompt; rerendered with thinking off\n", .{});
         },
         .no_mask, .token_zero => schema_proto_active = false,
@@ -21260,6 +21304,26 @@ test "ignore_eos: only a JSON true arms it, and it needs a max_tokens that fits"
     try std.testing.expect(ignoreEosRejectReason(512, 300) != null);
 }
 
+test "templateKwargsJson: an object passes through minus enable_thinking; anything else is refused" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, want: ?[]const u8 }{
+        .{ .body = "{}", .want = null },
+        .{ .body = "{\"chat_template_kwargs\":null}", .want = null },
+        .{ .body = "{\"chat_template_kwargs\":{\"enable_thinking\":true}}", .want = null },
+        .{ .body = "{\"chat_template_kwargs\":{\"enable_thinking\":false,\"thinking\":true,\"reasoning_effort\":\"low\"}}", .want = "{\"thinking\":true,\"reasoning_effort\":\"low\"}" },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        const got = try templateKwargsJson(allocator, parsed.value.object);
+        defer if (got) |g| allocator.free(g);
+        if (case.want) |w| try std.testing.expectEqualStrings(w, got.?) else try std.testing.expect(got == null);
+    }
+    const bad = try std.json.parseFromSlice(std.json.Value, allocator, "{\"chat_template_kwargs\":\"x\"}", .{});
+    defer bad.deinit();
+    try std.testing.expectError(error.InvalidTemplateKwargs, templateKwargsJson(allocator, bad.value.object));
+}
+
 test "nChoicesRejectReason: n>1 earns an honest 400, single-choice spellings pass" {
     const allocator = std.testing.allocator;
     const cases = [_]struct { body: []const u8, rejected: bool }{
@@ -21465,6 +21529,10 @@ test "resolveEnableThinking: an explicit request value outranks the arch default
         // A non-bool `enable_thinking` is not a signal; with nothing else in
         // the body the arch default still applies.
         .{ .body = "{\"enable_thinking\":\"yes\"}", .arch = true, .want = true },
+        // chat_template_kwargs is the most explicit spelling and decides alone.
+        .{ .body = "{\"enable_thinking\":true,\"chat_template_kwargs\":{\"enable_thinking\":false}}", .arch = true, .want = false },
+        .{ .body = "{\"reasoning_effort\":\"none\",\"chat_template_kwargs\":{\"enable_thinking\":true}}", .arch = false, .want = true },
+        .{ .body = "{\"chat_template_kwargs\":{\"reasoning_effort\":\"none\"}}", .arch = true, .want = false },
     };
     for (cases) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
