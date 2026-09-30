@@ -900,6 +900,36 @@ pub const ModelRegistry = struct {
         self.default_promoted = false;
     }
 
+    /// Register the launch model (`--model`) and make it the default. A
+    /// discovery entry with the same id or path is reused, never duplicated.
+    /// `served_name` (`--served-model-name`, "" = none) becomes the entry's
+    /// id: vLLM's flag, for clients that send one fixed model name to every
+    /// server. The basename id then no longer resolves. Boot-time only.
+    pub fn registerLaunchModel(self: *ModelRegistry, id: []const u8, path: []const u8, bytes_on_disk: ?u64, arch_hint: []const u8, served_name: []const u8) !*LoadedModel {
+        const name = if (served_name.len > 0) served_name else id;
+        const entry = self.peek(id) orelse self.peekByPath(path) orelse
+            try self.registerStubWithArch(name, path, bytes_on_disk, arch_hint);
+        if (!std.mem.eql(u8, entry.id, name)) try self.renameEntry(entry, name);
+        try self.setDefault(entry.id);
+        return entry;
+    }
+
+    /// Re-key `entry` under `new_id`; `error.DuplicateId` when another entry holds it.
+    fn renameEntry(self: *ModelRegistry, entry: *LoadedModel, new_id: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.entries.get(new_id) != null) return error.DuplicateId;
+        const owned = try self.allocator.dupe(u8, new_id);
+        errdefer self.allocator.free(owned);
+        try self.entries.ensureUnusedCapacity(1);
+        const was_default = std.mem.eql(u8, self.default_id, entry.id);
+        _ = self.entries.remove(entry.id);
+        self.allocator.free(entry.id);
+        entry.id = owned;
+        self.entries.putAssumeCapacityNoClobber(entry.id, entry);
+        if (was_default) self.default_id = entry.id;
+    }
+
     /// Look up an entry by its on-disk path (trailing slashes ignored).
     /// Same read-only contract as `peek`. Exists so the `--model` path and
     /// register-by-path flows reuse a discovery entry even when their
@@ -1755,6 +1785,51 @@ test "ModelRegistry: default routing on empty / mlx-serve" {
     const b = try reg.ensureLoaded("mlx-serve");
     try testing.expectEqual(lm, b);
     reg.release(b);
+}
+
+test "ModelRegistry: --served-model-name registers the launch model under that id as the default" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const lm = try reg.registerLaunchModel("Qwen3.8-27B-4bit", "/m/Qwen3.8-27B-4bit", 1024, "", "served");
+    try testing.expectEqualStrings("served", lm.id);
+    try testing.expectEqualStrings("served", reg.default_id);
+    try testing.expectEqual(lm, try reg.resolveEntry("served"));
+    try testing.expectEqual(lm, try reg.resolveEntry(""));
+    try testing.expectEqual(lm, try reg.resolveEntry("mlx-serve"));
+    try testing.expectError(error.UnknownModelId, reg.resolveEntry("Qwen3.8-27B-4bit"));
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markReadyLocked(lm, 1024);
+    reg.mutex.unlock(reg.io);
+    const a = try reg.ensureLoaded("served");
+    try testing.expectEqual(lm, a);
+    reg.release(a);
+
+    // Without the flag the basename id stands.
+    var plain = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer plain.deinit();
+    const p = try plain.registerLaunchModel("m", "/x/m", null, "", "");
+    try testing.expectEqualStrings("m", p.id);
+    try testing.expectEqual(p, try plain.resolveEntry(""));
+}
+
+test "ModelRegistry: --served-model-name re-keys a discovered entry and refuses a taken name" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    // Discovered under org/name; --model names the same dir by path.
+    const disc = try reg.registerStub("org/m", "/models/org/m", 1024);
+    _ = try reg.registerStub("other", "/models/other", 1024);
+    const lm = try reg.registerLaunchModel("m", "/models/org/m/", null, "", "served");
+    try testing.expectEqual(disc, lm);
+    try testing.expectEqual(@as(usize, 2), reg.entries.count());
+    try testing.expectEqual(lm, try reg.resolveEntry("served"));
+    try testing.expectError(error.UnknownModelId, reg.resolveEntry("org/m"));
+    try testing.expectEqual(lm, reg.peekByPath("/models/org/m").?);
+
+    var clash = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer clash.deinit();
+    _ = try clash.registerStub("served", "/models/served", 1024);
+    _ = try clash.registerStub("m", "/x/m", 1024);
+    try testing.expectError(error.DuplicateId, clash.registerLaunchModel("m", "/x/m", null, "", "served"));
 }
 
 test "ModelRegistry: ensureLoaded fails when no default and id empty" {

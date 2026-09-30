@@ -76,6 +76,9 @@ var ane_prefill: bool = false;
 var ane_media: ane_mod.MediaOffload = .{};
 // Serve-mode default for requests that omit max_tokens (0 = flag not given).
 var serve_default_max_tokens: u32 = 0;
+// `--served-model-name <id>`: the `--model` entry's registry id ("" = its
+// basename). Read by every serve path's `registerLaunchModel`.
+var served_model_name: []const u8 = "";
 
 /// `mlx-serve run` REPL thread: chats against the in-process server over
 /// its own Ollama /api/chat endpoint, then brings the server down cleanly
@@ -112,6 +115,8 @@ fn printUsage(io: std.Io) void {
         \\
         \\Options:
         \\  --model <dir>       Path to MLX model directory
+        \\  --served-model-name <id>  Serve --model under this id (the default
+        \\                      model) instead of its directory basename
         \\  --serve             Start HTTP server mode
         \\  --host <ip>         Bind address (default: 0.0.0.0 — open to the local
         \\                      network; a future version will default to 127.0.0.1)
@@ -600,6 +605,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--model") and i + 1 < args.len) {
             i += 1;
             model_dir = args[i];
+        } else if (std.mem.eql(u8, args[i], "--served-model-name") and i + 1 < args.len) {
+            i += 1;
+            served_model_name = args[i];
         } else if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
             i += 1;
             port = try std.fmt.parseInt(u16, args[i], 10);
@@ -1219,6 +1227,10 @@ pub fn main(init: std.process.Init) !void {
         // registry. The app uses this so a single server hosts chat + image +
         // audio + video, coexisting under one memory budget.
         if (model_dir.len == 0) {
+            if (served_model_name.len > 0) {
+                log.err("--served-model-name names the --model entry; pass --model <dir> too\n", .{});
+                std.process.exit(1);
+            }
             const discovery_for_registry = discovery_storage;
             discovery_storage = null; // ownership moves to the registry
             try runHeadlessServe(io, allocator, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config, force_mtp, cli_pld);
@@ -1400,15 +1412,9 @@ pub fn main(init: std.process.Init) !void {
         // Register the loaded model. Use the pre-registered discovery entry
         // when available (so id/path/bytes_on_disk are consistent across
         // /v1/models listings); otherwise create a fresh stub.
-        const entry = if (registry.peek(model_id)) |e|
-            e
-        else if (registry.peekByPath(model_dir)) |e|
-            // Discovered under an org/name id whose basename differs from
-            // model_id — reuse it, never register the same path twice.
-            e
-        else
-            try registry.registerStub(model_id, model_dir, null);
-        try registry.setDefault(entry.id);
+        // A discovery entry under an org/name id whose basename differs from
+        // model_id is reused — never register the same path twice.
+        const entry = try registry.registerLaunchModel(model_id, model_dir, null, "", served_model_name);
 
         // Ownership-transfer defer: registry takes ownership of
         // config/tok/chat_config IF the inference-thread load installed
@@ -1833,13 +1839,7 @@ fn runGenServe(
     const registry = try model_registry_mod.ModelRegistry.init(allocator, io, discovery, max_resident_models, effective_max_resident_mem, idle_evict_secs);
     defer registry.deinit();
 
-    const entry = if (registry.peek(model_id)) |e|
-        e
-    else if (registry.peekByPath(model_dir)) |e|
-        e
-    else
-        try registry.registerStubWithArch(model_id, model_dir, null, modality.modelType());
-    try registry.setDefault(entry.id);
+    const entry = try registry.registerLaunchModel(model_id, model_dir, null, modality.modelType(), served_model_name);
 
     // Registry takes ownership of the stub if the inference thread installed it.
     defer if (entry.config != null) {
@@ -2179,8 +2179,7 @@ fn runDs4Serve(
         const st = dir.statFile(io, name, .{}) catch break :blk null;
         break :blk @as(u64, @intCast(st.size));
     };
-    const entry = try registry.registerStub(model_id, gguf_path_owned, gguf_bytes);
-    try registry.setDefault(model_id);
+    const entry = try registry.registerLaunchModel(model_id, gguf_path_owned, gguf_bytes, "", served_model_name);
 
     // Once the inference thread hands ownership of the stub
     // config/tok/chat_config to the entry, the entry's deinit owns them —
@@ -2452,8 +2451,7 @@ fn runLlamaServe(
         const st = dir.statFile(io, name, .{}) catch break :blk null;
         break :blk @as(u64, @intCast(st.size));
     };
-    const entry = try registry.registerStub(model_id, gguf_path_owned, gguf_bytes);
-    try registry.setDefault(model_id);
+    const entry = try registry.registerLaunchModel(model_id, gguf_path_owned, gguf_bytes, "", served_model_name);
 
     defer if (entry.config != null) {
         config_owned_by_registry = true;
