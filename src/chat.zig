@@ -597,7 +597,9 @@ fn renderChatTemplateWith(
     /// the prompt ends mid-turn and generation resumes from its last word.
     continue_final: bool,
     /// Client `chat_template_kwargs`, a JSON object overlaid on the Jinja
-    /// context after the server's own keys, so an explicit key wins.
+    /// context after the server's own keys, so an explicit key wins. With
+    /// kwargs, a failed render is `error.TemplateRenderFailed`, not the
+    /// generic fallback.
     template_kwargs: ?[]const u8,
 ) ![]const u8 {
     // Split the partial reply off FIRST, so every transform below (tool
@@ -739,6 +741,15 @@ fn renderChatTemplateWith(
         return collapsed;
     }
 
+    // A client that sent `chat_template_kwargs` asked for the template's own
+    // rendering (a raise_exception on one of its values included); the
+    // generic fallback would serve a different prompt in silence.
+    if (template_kwargs != null) {
+        if (jinja_c.jinja_last_error()) |e| {
+            log.warn("jinja render failed with chat_template_kwargs ({s})\n", .{std.mem.span(e)});
+        }
+        return error.TemplateRenderFailed;
+    }
     // WARN, not debug: a failed render silently swaps the prompt into
     // fallbackFormatChat's generic format — for families whose stop/turn
     // tokens differ (Gemma 4's <|turn> vs the fallback's <start_of_turn>)
@@ -9608,6 +9619,27 @@ test "renderChatTemplate: chat_template_kwargs reach the Jinja context and overr
     const with = try renderChatTemplateWith(allocator, &messages, &config, null, null, false, null, false, "{\"reasoning_effort\":\"low\",\"custom_flag\":\"on\"}");
     defer allocator.free(with);
     try testing.expectEqualStrings("low|on|False", with);
+}
+
+test "renderChatTemplate: a render that raises under chat_template_kwargs is an error, not the fallback" {
+    const allocator = testing.allocator;
+    var config = ChatConfig{
+        .chat_template = "{%- if preserve_thinking is defined and preserve_thinking == 'yes' %}{{ raise_exception('bad preserve_thinking') }}{%- endif %}{{ messages[0].content }}",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+    const ok = try renderChatTemplateWith(allocator, &messages, &config, null, null, false, null, false, "{\"preserve_thinking\":true}");
+    defer allocator.free(ok);
+    try testing.expectEqualStrings("hi", ok);
+    try testing.expectError(error.TemplateRenderFailed, renderChatTemplateWith(allocator, &messages, &config, null, null, false, null, false, "{\"preserve_thinking\":\"yes\"}"));
+    // Without kwargs the same template keeps the generic fallback.
+    config.chat_template = "{{ raise_exception('always') }}";
+    const fb = try renderChatTemplate(allocator, &messages, &config, null, null, false, null, false);
+    defer allocator.free(fb);
+    try testing.expect(std.mem.indexOf(u8, fb, "hi") != null);
 }
 
 test "renderChatTemplate: REAL Hy3 chat_template.jinja renders without fallback (HY3_MODEL_DIR)" {
