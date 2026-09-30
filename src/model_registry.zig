@@ -901,7 +901,8 @@ pub const ModelRegistry = struct {
     }
 
     /// Register the launch model (`--model`) and make it the default. A
-    /// discovery entry with the same id or path is reused, never duplicated.
+    /// discovery entry with the same id or path is reused, never duplicated,
+    /// and keeps its id (an `org/name` discovery id stays addressable).
     /// `served_name` (`--served-model-name`, "" = none) becomes the entry's
     /// id: vLLM's flag, for clients that send one fixed model name to every
     /// server. The basename id then no longer resolves. Boot-time only.
@@ -909,7 +910,7 @@ pub const ModelRegistry = struct {
         const name = if (served_name.len > 0) served_name else id;
         const entry = self.peek(id) orelse self.peekByPath(path) orelse
             try self.registerStubWithArch(name, path, bytes_on_disk, arch_hint);
-        if (!std.mem.eql(u8, entry.id, name)) try self.renameEntry(entry, name);
+        if (served_name.len > 0 and !std.mem.eql(u8, entry.id, served_name)) try self.renameEntry(entry, served_name);
         try self.setDefault(entry.id);
         return entry;
     }
@@ -1810,6 +1811,20 @@ test "ModelRegistry: --served-model-name registers the launch model under that i
     const p = try plain.registerLaunchModel("m", "/x/m", null, "", "");
     try testing.expectEqualStrings("m", p.id);
     try testing.expectEqual(p, try plain.resolveEntry(""));
+}
+
+test "ModelRegistry: without --served-model-name a discovered org/name entry keeps its id" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    // --model /models/org/m with --model-dir /models: discovery holds "org/m".
+    const disc = try reg.registerStub("org/m", "/models/org/m", 1024);
+    const lm = try reg.registerLaunchModel("m", "/models/org/m", null, "", "");
+    try testing.expectEqual(disc, lm);
+    try testing.expectEqualStrings("org/m", lm.id);
+    try testing.expectEqualStrings("org/m", reg.default_id);
+    try testing.expectEqual(@as(usize, 1), reg.entries.count());
+    try testing.expectEqual(lm, try reg.resolveEntry("org/m"));
+    try testing.expectEqual(lm, try reg.resolveEntry(""));
 }
 
 test "ModelRegistry: --served-model-name re-keys a discovered entry and refuses a taken name" {
